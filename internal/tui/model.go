@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/charmbracelet/bubbles/textinput"
@@ -167,6 +168,14 @@ type Model struct {
 	confirm    *confirmModal
 	pins       pinned.Set
 	boardEpoch int
+	// lastRefreshSeq is the highest boardRefreshSeq whose JOB/workflow rows were applied this epoch (from
+	// EITHER chain); a refresh that read disk earlier but arrived later (the 3s/500ms chains race) is
+	// dropped so it can't resurrect a terminal row. lastBoardFullSeq is the same for the full-refresh-only
+	// state (teammates/meta/pins), bumped only by boardMsg — so a boardMsg whose jobs lost to a faster
+	// wfRefreshMsg still updates teammates, while a stale boardMsg can't roll that state back over a newer
+	// boardMsg. Both reset on board entry so the visit's first refresh always applies.
+	lastRefreshSeq   int64
+	lastBoardFullSeq int64
 	// boardSeen marks that a boardMsg has ever been accepted; a revisit then skips the
 	// "discovering…" loading frame and keeps the previous frame until the fresh load
 	// lands. boardEntryRoute defers the entry reset (cursors + focus park) to that
@@ -361,6 +370,7 @@ type boardMsg struct {
 	jobsErr     error
 	runs        []subagent.WorkflowRun
 	activity    map[string]activitySnapshot
+	seq         int64
 	sessionMeta map[string]sessiontitle.Meta
 	// endedSeen maps an ended team's name to its record LastSeen, so the card can
 	// render "ended · last seen <ts>" without threading a time into the synthetic
@@ -368,6 +378,9 @@ type boardMsg struct {
 	endedSeen map[string]time.Time
 	pins      pinned.Set
 	epoch     int
+	// fullSeq orders the full-refresh-only state (stamped at the teammate read); seq orders the job rows
+	// (stamped at ListJobs). Two stamps because boardMsg reads those at different times.
+	fullSeq int64
 }
 
 func (boardMsg) owningScreen() screen { return screenSpawn }
@@ -401,6 +414,13 @@ func loadProviders() tea.Msg {
 	return providersMsg{providers: res.Providers, defaultProvider: res.DefaultProvider}
 }
 
+// boardRefreshSeq is a process-wide monotonic counter stamped on each board/wf refresh as it finishes
+// reading from disk. Within one board epoch the 3s and 500ms chains race and their tea.Cmds can deliver
+// out of order; the handlers apply a refresh only when its seq is the newest seen, so a later-delivered
+// EARLIER read can't overwrite a fresh one (which would resurrect a just-terminal row, with its stale
+// live snapshot). Higher seq == read disk later == fresher.
+var boardRefreshSeq atomic.Int64
+
 // loadBoard returns a tea.Cmd that assembles a board refresh tagged with the
 // caller's epoch: discover teammates, annotate them with pane-scan health + the
 // hidden flag from team config, and list subagent jobs. A discovery error
@@ -410,6 +430,10 @@ func loadProviders() tea.Msg {
 // Update can drop a stale refresh from a prior visit.
 func loadBoard(epoch int) tea.Cmd {
 	return func() tea.Msg {
+		// Stamp the full-state freshness BEFORE the teammate read below — the full-refresh-only state
+		// (teammates/meta/pins) is gated on its own track, so its seq must order by when that read began,
+		// not by the later ListJobs stamp (the job rows carry the latter).
+		fullSeq := boardRefreshSeq.Add(1)
 		items, err := teardown.DiscoverTeammates()
 		// tmux absent from PATH isn't a board failure: the live-teammate lane is
 		// simply unavailable (it's the only tmux-dependent source), so drop the
@@ -425,6 +449,11 @@ func loadBoard(epoch int) tea.Cmd {
 			items = teardown.AnnotateLeadSession(items)
 		}
 		jobs, jobsErr := subagent.ListJobs()
+		// Stamp the freshness seq the instant job STATUS is read — before loadWfData's activity/run reads
+		// and the meta/team-history/pins work below, any of which can stall. The resurrection concern is a
+		// done row flashing back to running, so seq must order by when a row's status was observed; a slow
+		// older read then can't out-rank a fast newer one in the handler.
+		seq := boardRefreshSeq.Add(1)
 		runs, activity, wfErr := loadWfData(jobs)
 		if jobsErr == nil {
 			jobsErr = wfErr
@@ -456,6 +485,8 @@ func loadBoard(epoch int) tea.Cmd {
 			endedSeen:   endedSeen,
 			pins:        pins,
 			epoch:       epoch,
+			seq:         seq,
+			fullSeq:     fullSeq,
 		}
 	}
 }
@@ -510,20 +541,85 @@ func synthesizeEnded(live []teardown.Teammate, meta map[string]sessiontitle.Meta
 // excluded from the live "ok" / teammate-count rollups.
 const endedStatus = "ended"
 
-// loadWfData assembles the workflow half of a refresh from an already-listed job set: the
-// run manifests plus each RunID-tagged leaf's activity sidecar (live tokens + tool calls).
+// loadWfData assembles the live-token half of a refresh from an already-listed job set: the run
+// manifests plus each job's activity snapshot keyed by JobID — a workflow leaf or a sync subagent
+// from its <jobID>.activity sidecar, a detached background job synthesized from its poll-time Usage
+// (it writes no sidecar). This feeds both the workflow run headers and the standalone subagent rows,
+// so every running agent's token count climbs on the 500ms light tick.
 func loadWfData(jobs []subagent.Result) ([]subagent.WorkflowRun, map[string]activitySnapshot, error) {
 	activity := map[string]activitySnapshot{}
 	for _, j := range jobs {
-		if j.RunID == "" || j.JobID == "" {
+		if j.JobID == "" {
 			continue
 		}
-		if snap, ok := readLeafActivity(j.JobID); ok {
-			activity[j.JobID] = snap
+		// Only a RUNNING job's sidecar/Usage describes live activity. A queued/held job — notably a leaf
+		// requeued for its next attempt, whose old .activity can survive a best-effort remove — gets a bare
+		// attempt-stamped tombstone, never a sidecar read: reading a stale sidecar here would seed the
+		// current attempt's floor (snap.attempt is stamped from j) while queued, and floorActivity would
+		// carry that into the running phase as the same attempt.
+		if j.Status == "running" {
+			if snap, ok := readLeafActivity(j.JobID); ok {
+				snap.attempt = j.Attempt
+				activity[j.JobID] = snap
+				continue
+			}
+			// No sidecar (a detached background job): surface its running Usage — filled live by
+			// StatusFor's stream-json scan — so its row climbs like a sync leaf's.
+			if j.Usage != nil && (j.Usage.InputTokens > 0 || j.Usage.OutputTokens > 0) {
+				activity[j.JobID] = activitySnapshot{inTok: j.Usage.InputTokens, outTok: j.Usage.OutputTokens, hasUsage: true, attempt: j.Attempt}
+				continue
+			}
+		}
+		// A live job with no usage to show yet — the restart gap, or a queued/held leaf. A zero,
+		// hasUsage:false tombstone keeps the job present so floorActivity retains its per-attempt floor
+		// across out-of-order refreshes; liveTokens is gated on hasUsage, so a tombstone never changes the
+		// rendered tokens — it only preserves attempt order.
+		if j.Status == "running" || j.Status == "queued" || j.Status == "held" {
+			activity[j.JobID] = activitySnapshot{attempt: j.Attempt}
 		}
 	}
 	runs, err := subagent.ListRuns()
 	return runs, activity, err
+}
+
+// floorActivity keeps each job's live token snapshot monotonic across refreshes. The 3s full chain and
+// the 500ms light chain both scan the same jobs and their tea.Cmds can complete out of order, so a
+// later-delivered OLDER snapshot must not lower a job's already-shown input/output — the board would
+// tick down for a frame. The floor respects attempt order: a HIGHER attempt (a restart reusing the job
+// id with a fresh low count) resets the floor to the new attempt; an EQUAL attempt holds the monotonic
+// max; a LOWER attempt is a stale pre-restart refresh that finished late and is discarded for the newer
+// attempt already shown. A finished job leaves the live map (rendering from its terminal Result).
+// Mutates and returns next.
+func floorActivity(prev, next map[string]activitySnapshot) map[string]activitySnapshot {
+	for id, ns := range next {
+		ps, ok := prev[id]
+		if !ok {
+			continue
+		}
+		switch {
+		case ns.attempt > ps.attempt:
+			// A restart: take the fresh low count as-is so the floor resets to the new attempt.
+		case ns.attempt < ps.attempt:
+			// A pre-restart refresh landing late: keep the newer attempt, never the stale total.
+			next[id] = ps
+		default:
+			if ps.inTok > ns.inTok {
+				ns.inTok = ps.inTok
+			}
+			if ps.outTok > ns.outTok {
+				ns.outTok = ps.outTok
+			}
+			// Tool sigs accumulate within an attempt, so the longer list is the newer read; keep it rather
+			// than a shorter one carried by an out-of-order refresh (seq orders by ListJobs, not the sidecar
+			// read), so the tool count + Activity feed never tick backward while in/out are floored.
+			if len(ps.sigs) > len(ns.sigs) {
+				ns.sigs = ps.sigs
+			}
+			ns.hasUsage = ns.hasUsage || ps.hasUsage
+			next[id] = ns
+		}
+	}
+	return next
 }
 
 // wfTagged filters a job list down to the RunID-tagged workflow leaves.
@@ -537,15 +633,18 @@ func wfTagged(jobs []subagent.Result) []subagent.Result {
 	return out
 }
 
-// wfRefreshMsg carries a LIGHT workflow-only refresh (run manifests + leaf jobs + activity
-// sidecars — never teammate discovery or pane capture), driven by the 500ms live chain so a
-// running run's counters climb smoothly between the 3s full refreshes. Owned by screenSpawn,
-// boardEpoch-gated like boardMsg.
+// wfRefreshMsg carries a LIGHT refresh (the full subagent job list + run manifests + activity sidecars —
+// never teammate discovery or pane capture), driven by the 500ms live chain so a running run's counters
+// AND a standalone background subagent's row climb smoothly between the 3s full refreshes. jobs is the
+// full ListJobs result (mirror boardMsg) so a standalone row's status/usage refresh at 500ms too, not
+// only on the 3s tick. Owned by screenSpawn, boardEpoch-gated like boardMsg.
 type wfRefreshMsg struct {
 	jobs     []subagent.Result
+	jobsErr  error
 	runs     []subagent.WorkflowRun
 	activity map[string]activitySnapshot
 	epoch    int
+	seq      int64
 }
 
 func (wfRefreshMsg) owningScreen() screen { return screenSpawn }
@@ -556,9 +655,13 @@ type wfLiveTickMsg struct{ epoch int }
 // loadWfLight reads only the workflow data (no teammate discovery, no pane capture).
 func loadWfLight(epoch int) tea.Cmd {
 	return func() tea.Msg {
-		all, _ := subagent.ListJobs()
-		runs, activity, _ := loadWfData(all)
-		return wfRefreshMsg{jobs: wfTagged(all), runs: runs, activity: activity, epoch: epoch}
+		all, jobsErr := subagent.ListJobs()
+		seq := boardRefreshSeq.Add(1) // stamp at the job-status read, before loadWfData (see loadBoard)
+		runs, activity, wfErr := loadWfData(all)
+		if jobsErr == nil {
+			jobsErr = wfErr
+		}
+		return wfRefreshMsg{jobs: all, jobsErr: jobsErr, runs: runs, activity: activity, epoch: epoch, seq: seq}
 	}
 }
 
@@ -572,7 +675,7 @@ func wfLiveTick(epoch int) tea.Cmd {
 // startWfLive starts the 500ms light chain when a refresh sees a running leaf and no chain
 // is already live; the chain stops itself (clearing the flag) once nothing runs.
 func (m *Model) startWfLive() tea.Cmd {
-	if m.wfLiveOn || !m.anyLeafRunning() {
+	if m.wfLiveOn || !m.anyAgentRunning() {
 		return nil
 	}
 	m.wfLiveOn = true
@@ -992,6 +1095,23 @@ func (m Model) anyLeafRunning() bool {
 	return false
 }
 
+// anyJobRunning reports whether any STANDALONE subagent job is live — so the 500ms light chain also
+// ticks for a background subagent's climbing token count, not just for workflow runs. Workflow leaves
+// (RunID set) are covered by anyLeafRunning via m.workflowJobs; this scans only RunID=="" rows so a
+// finished leaf can't keep the chain alive through a standalone scan.
+func (m Model) anyJobRunning() bool {
+	for _, j := range m.jobs {
+		if j.RunID == "" && j.Status == "running" {
+			return true
+		}
+	}
+	return false
+}
+
+// anyAgentRunning is the live-tick predicate: a workflow leaf/run OR a standalone job is running.
+// Both the start gate and the keep-alive gate use it, so the chain can't start then die after a tick.
+func (m Model) anyAgentRunning() bool { return m.anyLeafRunning() || m.anyJobRunning() }
+
 // paneVisMsg carries the outcome of an inline hide/show so the board can surface
 // a failure (its code/reason/suggestion) instead of silently relying on the next
 // refresh to show an unchanged HIDDEN column. Its handler pops an info modal and
@@ -1396,19 +1516,32 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		prevBox, hadBox := m.boxRowRef()
 		m.loading = false
 		m.boardSeen = true
-		// Pre-group session → team so the session tree (recomputed per render off these
-		// slices, mirror wfGroups) renders contiguously on every update path, tests included.
-		m.teammates = groupByTeam(msg.teammates)
-		m.spawnErr = msg.teamErr
-		m.tmuxMissing = msg.tmuxMissing
-		m.jobs = msg.jobs
-		m.boardJobsErr = msg.jobsErr
-		m.workflowJobs = wfTagged(msg.jobs)
-		m.workflowRuns = msg.runs
-		m.wfActivity = msg.activity
-		m.sessionMeta = msg.sessionMeta
-		m.endedSeen = msg.endedSeen
-		m.pins = msg.pins
+		// Teammate / session-meta / pin state is full-refresh-only (the 500ms light chain never carries it),
+		// gated on fullSeq — stamped at the teammate read, on a boardMsg-only track. So a boardMsg whose JOB
+		// rows lost the shared-seq race to a faster wfRefreshMsg still updates it (the light chain never
+		// bumps lastBoardFullSeq), but a stale boardMsg can't roll it back over a newer boardMsg. Pre-group
+		// session → team so the session tree (recomputed per render off these slices, mirror wfGroups)
+		// renders contiguously on every update path.
+		if msg.fullSeq >= m.lastBoardFullSeq {
+			m.lastBoardFullSeq = msg.fullSeq
+			m.teammates = groupByTeam(msg.teammates)
+			m.spawnErr = msg.teamErr
+			m.tmuxMissing = msg.tmuxMissing
+			m.sessionMeta = msg.sessionMeta
+			m.endedSeen = msg.endedSeen
+			m.pins = msg.pins
+		}
+		// The job/workflow rows are seq-gated against BOTH chains: a refresh that read disk earlier but
+		// arrived after a newer one (the 3s/500ms chains race within an epoch) would otherwise resurrect a
+		// just-terminal job as running, with its stale live snapshot.
+		if msg.seq >= m.lastRefreshSeq {
+			m.lastRefreshSeq = msg.seq
+			m.jobs = msg.jobs
+			m.boardJobsErr = msg.jobsErr
+			m.workflowJobs = wfTagged(msg.jobs)
+			m.workflowRuns = msg.runs
+			m.wfActivity = floorActivity(m.wfActivity, msg.activity)
+		}
 		// Preserve the drill state: re-route if the focus chain broke, re-find the L2 row
 		// by identity, index-clamp the entity cursor, re-clamp the card scroll.
 		m.rerootSpawn()
@@ -1478,10 +1611,21 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.epoch != m.boardEpoch {
 			return m, nil
 		}
+		// Same out-of-order drop as boardMsg: an earlier-read refresh arriving late must not roll the
+		// workflow rows + live snapshots back over a fresher one.
+		if msg.seq < m.lastRefreshSeq {
+			return m, nil
+		}
+		m.lastRefreshSeq = msg.seq
 		prevBox, hadBox := m.boxRowRef()
-		m.workflowJobs = msg.jobs
+		// The light chain carries the full job list too, so a standalone subagent row's status/usage
+		// refresh at 500ms — otherwise it lags 3s behind its own live snapshot and falls back to a stale,
+		// lower usage (a visible down-jump) and a stuck "running" when the job finishes between full ticks.
+		m.jobs = msg.jobs
+		m.boardJobsErr = msg.jobsErr
+		m.workflowJobs = wfTagged(msg.jobs)
 		m.workflowRuns = msg.runs
-		m.wfActivity = msg.activity
+		m.wfActivity = floorActivity(m.wfActivity, msg.activity)
 		m.rerootSpawn()
 		if hadBox {
 			m.reanchorBox(prevBox)
@@ -1492,7 +1636,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case wfLiveTickMsg:
 		if m.screen == screenSpawn && msg.epoch == m.boardEpoch {
-			if m.anyLeafRunning() {
+			if m.anyAgentRunning() {
 				return m, tea.Batch(loadWfLight(msg.epoch), wfLiveTick(msg.epoch))
 			}
 			m.wfLiveOn = false // nothing runs — the chain ends; a later refresh restarts it
@@ -1818,6 +1962,7 @@ func (m Model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// bump can't overwrite the new visit's state (its msg.epoch fails the
 		// gate in the boardMsg handler).
 		m.boardEpoch++
+		m.lastRefreshSeq, m.lastBoardFullSeq = 0, 0 // a new visit's first refresh always applies (its seq beats the reset)
 		return m, tea.Batch(loadBoard(m.boardEpoch), boardTick(m.boardEpoch))
 	case "up", "k":
 		if m.providerCursor > 0 {
