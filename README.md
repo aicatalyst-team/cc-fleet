@@ -1,8 +1,8 @@
-![cc-fleet — plug any third-party model into Claude Code's Dynamic Workflows, Agent Teams, and Subagents](docs/assets/cc-fleet-banner.png)
+![cc-fleet — turn any third-party model into a real Claude agent for Dynamic Workflows, Agent Teams, and Subagents in Claude Code or Codex](docs/assets/cc-fleet-banner.png)
 
 <h1 align="center">🚢 cc-fleet</h1>
 
-<p align="center"><strong>🤖 Plug any third-party model into Claude Code's ⚙️ Dynamic Workflows, 👥 Agent Teams, and ⚡ Subagents — from DeepSeek · GLM · Kimi · Qwen … to your Codex subscription, with your main session's auth untouched; no Claude subscription needed to run a full Claude Code on any provider 🚀</strong></p>
+<p align="center"><strong>🤖 cc-fleet turns any third-party model — DeepSeek · GLM · Kimi · Qwen … — into a real Claude agent, running ⚙️ Dynamic Workflows, 👥 Agent Teams, and ⚡ Subagents in Claude Code or Codex, driven by your subscription 🚀</strong></p>
 
 <div align="center">
 
@@ -48,7 +48,12 @@ curl -fsSL https://raw.githubusercontent.com/ethanhq/cc-fleet/main/install.sh | 
 irm https://raw.githubusercontent.com/ethanhq/cc-fleet/main/install.ps1 | iex
 ```
 
-**Codex plugin** — to drive cc-fleet from a Codex session, after the install above run `codex plugin marketplace add ethanhq/cc-fleet` then `codex plugin add cc-fleet`.
+**Codex plugin** — to drive cc-fleet from a Codex session, after the install above:
+
+```bash
+codex plugin marketplace add ethanhq/cc-fleet
+codex plugin add cc-fleet@cc-fleet
+```
 
 > Other channels (npm / go install / Releases / source) and adding the Claude Code plugin, installer overrides, and requirements & maintenance live in **[Install & maintenance](docs/install.md)**.
 
@@ -277,7 +282,7 @@ ccf workflow run audit.js --resume "$RUN"   # replay the journal, finished leave
 
 ### 🧩 Drive from Codex
 
-cc-fleet plugs into **OpenAI Codex** too: a Codex plugin lets a Codex session fan out the same provider workers — one-shot or batch **subagents** (`cc-fleet subagent`) and multi-phase JS **workflows** (`cc-fleet workflow`), each a real `claude` process on the provider's model. Install it with `codex plugin marketplace add ethanhq/cc-fleet` then `codex plugin add cc-fleet` (the `cc-fleet` and `claude` binaries install separately). The teammate lane stays Claude-Code-only; from Codex you get the subagent and workflow fan-out.
+cc-fleet plugs into **OpenAI Codex** too: a Codex plugin lets a Codex session fan out the same provider workers — one-shot or batch **subagents** (`cc-fleet subagent`) and multi-phase JS **workflows** (`cc-fleet workflow`), each a real `claude` process on the provider's model. The teammate lane stays Claude-Code-only; from Codex you get the subagent and workflow fan-out. (Set it up from [Install](#install) above.)
 
 ---
 
