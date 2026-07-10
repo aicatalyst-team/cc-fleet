@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: poc-cc-fleet
+  labels:
+    app.kubernetes.io/name: cc-fleet
+    app.kubernetes.io/managed-by: autopoc

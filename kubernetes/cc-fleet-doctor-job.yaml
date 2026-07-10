@@ -1,0 +1,33 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: cc-fleet-doctor
+  namespace: poc-cc-fleet
+  labels:
+    app: cc-fleet
+    autopoc.io/project: cc-fleet
+    autopoc.io/scenario: doctor-check
+spec:
+  backoffLimit: 1
+  activeDeadlineSeconds: 60
+  template:
+    spec:
+      containers:
+        - name: cc-fleet
+          image: quay.io/aicatalyst/cc-fleet:latest
+          imagePullPolicy: Always
+          command: ["cc-fleet"]
+          args: ["doctor"]
+          resources:
+            requests:
+              memory: "64Mi"
+              cpu: "100m"
+            limits:
+              memory: "128Mi"
+              cpu: "250m"
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+      restartPolicy: Never
