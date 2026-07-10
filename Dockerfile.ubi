@@ -1,0 +1,27 @@
+# Stage 1: Build
+FROM registry.access.redhat.com/ubi9/go-toolset AS builder
+
+WORKDIR /opt/app-root/src
+
+# Copy dependency files first for layer caching
+COPY go.mod go.sum ./
+RUN go mod download
+
+# Copy all source code
+COPY . .
+
+# Build static binary
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /opt/app-root/cc-fleet ./cmd/cc-fleet
+
+# Stage 2: Runtime
+FROM registry.access.redhat.com/ubi9/ubi-minimal
+
+COPY --from=builder /opt/app-root/cc-fleet /usr/local/bin/cc-fleet
+
+RUN microdnf install -y shadow-utils && microdnf clean all && \
+    chgrp -R 0 /usr/local/bin/cc-fleet && chmod -R g=u /usr/local/bin/cc-fleet
+
+USER 1001
+
+ENTRYPOINT ["cc-fleet"]
+CMD ["--help"]
