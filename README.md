@@ -1,4 +1,10 @@
-![cc-fleet — plug any third-party model into Claude Code's Dynamic Workflows, Agent Teams, and Subagents](docs/assets/cc-fleet-banner.png)
+> [!WARNING]
+> **This repository is archived.**
+>
+> Archived on 2026-09-08 by the AI Catalyst Platform Team.
+> It is read-only and no longer maintained.
+
+---![cc-fleet — plug any third-party model into Claude Code's Dynamic Workflows, Agent Teams, and Subagents](docs/assets/cc-fleet-banner.png)
 
 <h1 align="center">🚢 cc-fleet</h1>
 
